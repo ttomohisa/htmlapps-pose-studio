@@ -34,8 +34,8 @@ foreach ($placeholder in @($ForbiddenPlaceholders)) {
   }
 }
 
-if ($RequireNetworkBlock -and $html -notmatch "connect-src\s+'none'") {
-  throw "connect-src 'none' is missing from Content Security Policy"
+if ($RequireNetworkBlock -and $html -notmatch 'connect-src\s+(?:''none''|blob:)(?:\s*;|\s*["''])') {
+  throw "Network-blocking connect-src is missing from Content Security Policy"
 }
 
 if ($RequireCanonicalIcon) {
