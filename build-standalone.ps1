@@ -11,8 +11,8 @@ Set-StrictMode -Version Latest
 
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $TemplatePath = Join-Path $Root "src\index.template.html"
-$AppConfigPath = Join-Path $Root "app.config.json"
 $AppIconPath = Join-Path $Root "assets\favicon.svg"
+$AppConfigPath = Join-Path $Root "app.config.json"
 $DependenciesPath = Join-Path $Root "dependencies.json"
 $DependencyLockPath = Join-Path $Root "dependencies.lock.json"
 $VerifyPath = Join-Path $Root "scripts\verify-standalone.ps1"
@@ -49,13 +49,48 @@ function Get-Sha256FileHex([string]$Path) {
   }
 }
 
+function Get-FileHashBase64([string]$Path, [string]$AlgorithmName) {
+  $algorithm = $null
+  switch ($AlgorithmName.ToLowerInvariant()) {
+    "sha512" { $algorithm = [System.Security.Cryptography.SHA512]::Create() }
+    "sha256" { $algorithm = [System.Security.Cryptography.SHA256]::Create() }
+    "sha1" { $algorithm = [System.Security.Cryptography.SHA1]::Create() }
+    default { return $null }
+  }
+  $stream = [System.IO.File]::OpenRead($Path)
+  try {
+    return [Convert]::ToBase64String($algorithm.ComputeHash($stream))
+  } finally {
+    $algorithm.Dispose()
+    $stream.Dispose()
+  }
+}
+
+function Test-NpmIntegrity([string]$Path, [string]$Integrity) {
+  if ([string]::IsNullOrWhiteSpace($Integrity)) { return $true }
+  $supportedTokenFound = $false
+  foreach ($token in ($Integrity -split '\s+')) {
+    if ([string]::IsNullOrWhiteSpace($token)) { continue }
+    $separator = $token.IndexOf('-')
+    if ($separator -le 0) { continue }
+    $algorithmName = $token.Substring(0, $separator)
+    $expected = $token.Substring($separator + 1)
+    $actual = Get-FileHashBase64 $Path $algorithmName
+    if ($null -eq $actual) { continue }
+    $supportedTokenFound = $true
+    if ($actual -eq $expected) { return $true }
+  }
+  if (-not $supportedTokenFound) { throw "npm integrity uses no supported hash algorithm: $Integrity" }
+  return $false
+}
+
 function Get-SafeId([string]$Value) {
   if ([string]::IsNullOrWhiteSpace($Value)) { throw "Dependency id cannot be empty." }
   if ($Value -notmatch '^[a-z0-9][a-z0-9._-]*$') { throw "Dependency id '$Value' must use lowercase letters, numbers, dot, underscore, or hyphen." }
   return $Value
 }
 
-function Get-NpmPackage([string]$PackageName, [string]$Version) {
+function Get-NpmPackage([string]$PackageName, [string]$Version, [string]$ExpectedSha256 = "", [string]$ExpectedIntegrity = "") {
   if ([string]::IsNullOrWhiteSpace($PackageName) -or [string]::IsNullOrWhiteSpace($Version)) {
     throw "Every dependency requires package and version."
   }
@@ -89,6 +124,14 @@ function Get-NpmPackage([string]$PackageName, [string]$Version) {
     Write-Step "Using cached archive for $PackageName@$Version"
   }
 
+  $archiveSha256 = Get-Sha256FileHex $archivePath
+  if (-not [string]::IsNullOrWhiteSpace($ExpectedSha256) -and $archiveSha256 -ne $ExpectedSha256.ToLowerInvariant()) {
+    throw "Locked tarball SHA-256 mismatch for $PackageName@$Version. Expected $ExpectedSha256, got $archiveSha256. Refusing to extract."
+  }
+  if (-not [string]::IsNullOrWhiteSpace($ExpectedIntegrity) -and -not (Test-NpmIntegrity $archivePath $ExpectedIntegrity)) {
+    throw "Locked npm integrity mismatch for $PackageName@$Version. Refusing to extract."
+  }
+
   if (-not (Test-Path $packageDir)) {
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $extractRoot
     New-Item -ItemType Directory -Force -Path $extractRoot | Out-Null
@@ -105,8 +148,44 @@ function Get-NpmPackage([string]$PackageName, [string]$Version) {
   return [ordered]@{
     Root = $packageDir
     Archive = $archivePath
-    ArchiveSha256 = (Get-Sha256FileHex $archivePath)
+    ArchiveSha256 = $archiveSha256
   }
+}
+
+function Get-RemoteAsset([string]$Id, [string]$Key, [string]$Url, [string]$ExpectedSha256) {
+  if ([string]::IsNullOrWhiteSpace($Url) -or $Url -notmatch '^https://') { throw "Remote asset $Id/$Key requires an https URL." }
+  if ($ExpectedSha256 -notmatch '^[0-9a-fA-F]{64}$') { throw "Remote asset $Id/$Key requires a 64-character SHA-256." }
+
+  $remoteRoot = Join-Path $CacheRoot "remote-assets"
+  $assetRoot = Join-Path $remoteRoot ((($Id + '-' + $Key) -replace '[^A-Za-z0-9._-]', '-'))
+  $assetPath = Join-Path $assetRoot "asset.bin"
+  New-Item -ItemType Directory -Force -Path $assetRoot | Out-Null
+
+  $needDownload = $ForceDownload -or -not (Test-Path $assetPath)
+  if (-not $needDownload) {
+    $cachedSha = Get-Sha256FileHex $assetPath
+    if ($cachedSha.ToLowerInvariant() -ne $ExpectedSha256.ToLowerInvariant()) {
+      Remove-Item -Force $assetPath
+      $needDownload = $true
+    }
+  }
+
+  if ($needDownload) {
+    $partialPath = "$assetPath.part"
+    Remove-Item -Force -ErrorAction SilentlyContinue $partialPath
+    Write-Step "Downloading remote asset $Id/$Key"
+    Invoke-WebRequest -Uri $Url -OutFile $partialPath -UseBasicParsing -Headers @{ "User-Agent" = "single-html-app-template/1.0" }
+    $actualSha = Get-Sha256FileHex $partialPath
+    if ($actualSha.ToLowerInvariant() -ne $ExpectedSha256.ToLowerInvariant()) {
+      Remove-Item -Force $partialPath
+      throw "SHA-256 mismatch for remote asset $Id/$Key. Expected $ExpectedSha256 but got $actualSha."
+    }
+    Move-Item -Force $partialPath $assetPath
+  } else {
+    Write-Step "Using cached remote asset $Id/$Key"
+  }
+
+  return $assetPath
 }
 
 function Get-MimeType([string]$Path) {
@@ -184,6 +263,9 @@ if (-not (Get-Command tar.exe -ErrorAction SilentlyContinue)) {
   throw "tar.exe was not found. Use a current Windows 10/11 environment, or install bsdtar and expose it as tar.exe."
 }
 
+$appConfig = Get-Json $AppConfigPath
+$dependencyConfig = Get-Json $DependenciesPath
+$dependencyLock = Get-Json $DependencyLockPath
 if (-not (Test-Path -LiteralPath $AppIconPath -PathType Leaf)) {
   throw "Canonical app icon was not found: $AppIconPath"
 }
@@ -221,6 +303,7 @@ if (-not $OutputPathWasSpecified) {
   $rootHtmlOutputPath = Join-Path $Root $rootHtmlOutputName
 }
 if (-not $dependencyConfig.dependencies) { $dependencies = @() } else { $dependencies = @($dependencyConfig.dependencies) }
+if (-not ($dependencyConfig.PSObject.Properties.Name -contains "remoteAssets") -or -not $dependencyConfig.remoteAssets) { $remoteAssetGroups = @() } else { $remoteAssetGroups = @($dependencyConfig.remoteAssets) }
 if (-not ($dependencyLock.PSObject.Properties.Name -contains "schemaVersion") -or [int]$dependencyLock.schemaVersion -ne 1) {
   throw "dependencies.lock.json must use schemaVersion 1."
 }
@@ -251,14 +334,18 @@ foreach ($dependency in $dependencies) {
   if ([string]$lockedDependency.package -ne [string]$dependency.package -or [string]$lockedDependency.version -ne [string]$dependency.version) {
     throw "Dependency lock mismatch for '$id'. Run .\scripts\sync-dependency-lock.ps1 -Id $id."
   }
-  if ([string]$lockedDependency.tarballSha256 -notmatch '^[a-f0-9]{64}$') {
+  $lockedSha256 = ""
+  $lockedIntegrity = ""
+  if ($lockedDependency.PSObject.Properties.Name -contains "tarballSha256") { $lockedSha256 = ([string]$lockedDependency.tarballSha256).ToLowerInvariant() }
+  if ($lockedDependency.PSObject.Properties.Name -contains "integrity") { $lockedIntegrity = [string]$lockedDependency.integrity }
+  if (-not [string]::IsNullOrWhiteSpace($lockedSha256) -and $lockedSha256 -notmatch '^[a-f0-9]{64}$') {
     throw "Dependency lock for '$id' has an invalid tarballSha256."
   }
-
-  $package = Get-NpmPackage ([string]$dependency.package) ([string]$dependency.version)
-  if ($package.ArchiveSha256 -ne [string]$lockedDependency.tarballSha256) {
-    throw "Locked tarball SHA-256 mismatch for '$id'. Expected $([string]$lockedDependency.tarballSha256), got $($package.ArchiveSha256). Refusing to build."
+  if ([string]::IsNullOrWhiteSpace($lockedSha256) -and [string]::IsNullOrWhiteSpace($lockedIntegrity)) {
+    throw "Dependency lock for '$id' requires tarballSha256 or npm integrity."
   }
+
+  $package = Get-NpmPackage ([string]$dependency.package) ([string]$dependency.version) $lockedSha256 $lockedIntegrity
   $dependencyAssets = [ordered]@{}
   $manifestAssets = @()
   $assetKeys = @{}
@@ -272,6 +359,18 @@ foreach ($dependency in $dependencies) {
     $strip = $false
     if ($asset.PSObject.Properties.Name -contains "stripSourceMapComment") { $strip = [bool]$asset.stripSourceMapComment }
     $bytes = Get-AssetBytes $assetPath $strip
+    if ($id -eq "mediapipe-vision" -and $key -eq "module") {
+      # MediaPipe 1.0.1 creates a periodic telemetry sender even for local models.
+      # Replace ONLY the sender construction; retain inference and CSP protection.
+      $moduleText = [System.Text.Encoding]::UTF8.GetString($bytes)
+      $telemetryConstructor = 'this.l=new Fh(r)'
+      if (([regex]::Matches($moduleText, [regex]::Escape($telemetryConstructor))).Count -ne 1) {
+        throw "MediaPipe privacy transform no longer matches. Review the pinned runtime before building."
+      }
+      $moduleText = $moduleText.Replace($telemetryConstructor, 'this.l={error:true,close(){},flush(){}}')
+      $bytes = [System.Text.Encoding]::UTF8.GetBytes($moduleText)
+    }
+
     $configuredMime = ""
     if ($asset.PSObject.Properties.Name -contains "mime") { $configuredMime = [string]$asset.mime }
     $mime = if ([string]::IsNullOrWhiteSpace($configuredMime)) { Get-MimeType $assetPath } else { $configuredMime }
@@ -333,14 +432,90 @@ foreach ($dependency in $dependencies) {
     license = $license
     homepage = $homepage
     tarballSha256 = $package.ArchiveSha256
+    integrity = $lockedIntegrity
     locked = $true
+    assets = $manifestAssets
+  }
+}
+
+foreach ($group in $remoteAssetGroups) {
+  $id = Get-SafeId ([string]$group.id)
+  if ($ids.ContainsKey($id)) { throw "Duplicate dependency/asset id: $id" }
+  $ids[$id] = $true
+
+  $dependencyAssets = [ordered]@{}
+  $manifestAssets = @()
+  $assetKeys = @{}
+
+  foreach ($asset in @($group.assets)) {
+    $key = Get-SafeId ([string]$asset.key)
+    if ($assetKeys.ContainsKey($key)) { throw "Duplicate asset key '$key' in remote asset group '$id'." }
+    $assetKeys[$key] = $true
+
+    $url = [string]$asset.url
+    $expectedSha = ([string]$asset.sha256).ToLowerInvariant()
+    $assetPath = Get-RemoteAsset $id $key $url $expectedSha
+    $bytes = [System.IO.File]::ReadAllBytes($assetPath)
+    $actualSha = Get-Sha256FileHex $assetPath
+    if ($actualSha.ToLowerInvariant() -ne $expectedSha) { throw "Remote asset hash changed after cache validation: $id/$key" }
+
+    $configuredMime = ""
+    if ($asset.PSObject.Properties.Name -contains "mime") { $configuredMime = [string]$asset.mime }
+    $mime = if ([string]::IsNullOrWhiteSpace($configuredMime)) { "application/octet-stream" } else { $configuredMime }
+
+    $compressionSetting = "none"
+    if ($asset.PSObject.Properties.Name -contains "compression") { $compressionSetting = ([string]$asset.compression).ToLowerInvariant() }
+    if ($compressionSetting -notin @("none", "gzip", "auto")) {
+      throw "Unsupported compression '$compressionSetting' for $id/$key. Use none, gzip, or auto."
+    }
+
+    $storedBytes = $bytes
+    $resolvedCompression = "none"
+    if ($compressionSetting -in @("gzip", "auto")) {
+      $gzipBytes = Compress-GzipBytes $bytes
+      if ($compressionSetting -eq "gzip" -or $gzipBytes.Length -lt $bytes.Length) {
+        $storedBytes = $gzipBytes
+        $resolvedCompression = "gzip"
+      }
+    }
+
+    $dependencyAssets[$key] = [ordered]@{
+      mime = $mime
+      compression = $resolvedCompression
+      originalBytes = $bytes.Length
+      storedBytes = $storedBytes.Length
+      base64 = [Convert]::ToBase64String($storedBytes)
+    }
+    $manifestAssets += [ordered]@{
+      key = $key
+      path = $url
+      mime = $mime
+      compression = $resolvedCompression
+      bytes = $bytes.Length
+      storedBytes = $storedBytes.Length
+      sha256 = $actualSha
+    }
+  }
+
+  $assetBundle.dependencies[$id] = [ordered]@{
+    package = "remote-asset"
+    version = [string]$group.version
+    assets = $dependencyAssets
+  }
+  $manifestDependencies += [ordered]@{
+    id = $id
+    package = "remote-asset"
+    version = [string]$group.version
+    license = [string]$group.license
+    homepage = [string]$group.homepage
+    tarballSha256 = ""
     assets = $manifestAssets
   }
 }
 
 $manifest = [ordered]@{
   schemaVersion = 2
-  builder = "single-html-app-template/1.3"
+  builder = "single-html-app-template/1.3+pose-assets"
   generatedAtUtc = [DateTime]::UtcNow.ToString("o")
   app = [ordered]@{
     name = [string]$appConfig.name
@@ -386,9 +561,7 @@ New-Item -ItemType Directory -Force -Path $outputDirectory | Out-Null
   -RequireNetworkBlock ([bool]$appConfig.build.blockRuntimeNetwork) `
   -ForbiddenPlaceholders @($replacements.Keys)
 
-if (-not [string]::IsNullOrWhiteSpace($rootHtmlOutputPath)) {
-  [System.IO.File]::Copy($OutputPath, $rootHtmlOutputPath, $true)
-}
+if (-not [string]::IsNullOrWhiteSpace($rootHtmlOutputPath)) { [System.IO.File]::Copy($OutputPath, $rootHtmlOutputPath, $true) }
 
 $selfExtractEnabled = $false
 $selfExtractOutputPath = ""
@@ -481,9 +654,6 @@ $outputHash = Get-Sha256FileHex $OutputPath
 $outputSizeMb = [Math]::Round($readableBytes / 1MB, 2)
 Write-Host ""
 Write-Host "[OK] Standalone HTML: $OutputPath" -ForegroundColor Green
-if (-not [string]::IsNullOrWhiteSpace($rootHtmlOutputPath)) {
-  Write-Host "[OK] Repository-root HTML: $rootHtmlOutputPath" -ForegroundColor Green
-}
 Write-Host "[OK] Size: $outputSizeMb MB"
 Write-Host "[OK] SHA-256: $outputHash"
 Write-Host "[OK] Fetch/XHR/WebSocket-style runtime network access is blocked by CSP."

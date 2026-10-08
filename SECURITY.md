@@ -14,43 +14,83 @@ Include:
 - Reproduction steps.
 - Expected and actual behavior.
 - Security impact.
-- A minimal test file when file parsing is involved.
+- A minimal pose JSON / template file when import parsing is involved.
 
 ## Trust model
 
-The default template is a static browser application with no backend. Its primary protections are:
+Pose Studio is a static browser application with no backend.
 
-- No ordinary runtime CDN/API connection (`connect-src 'none'`). Optional peer-to-peer WebRTC must be explicit in the product specification and must not introduce hidden signaling/STUN/TURN services.
-- Explicitly pinned and embedded third-party files.
-- Committed `dependencies.lock.json` tarball SHA-256 values verified before embedding.
-- SHA-256 records in the generated dependency manifest.
-- No analytics, telemetry, remote fonts, or silent update checks.
-- User-initiated downloads rather than automatic uploads.
+Its primary protections are:
 
-A generated HTML file is executable code. Distribute it through a trusted channel and verify hashes for high-trust workflows.
+- Camera frames are transient inference input and are not recorded by the application.
+- Recordings contain pose landmarks and timestamps, not source video.
+- Recordings and references are stored in local IndexedDB.
+- Runtime JavaScript, WASM, and the pose model are embedded into the generated HTML.
+- Third-party package versions are pinned exactly.
+- The Pose Landmarker model is pinned to an exact HTTPS build source and SHA-256.
+- `connect-src blob:` is the only runtime connection permission required by the main application. `script-src 'wasm-unsafe-eval'` is permitted only for the embedded MediaPipe WebAssembly runtime. HTTP and HTTPS runtime connections are blocked by CSP.
+- No analytics, telemetry, remote fonts, account system, cloud storage, silent update check, or upload API is included.
+- Downloads happen only after explicit user action.
 
-If an app uses `components/webrtc-qr-pairing.html`, treat the paired browser as an explicit data recipient. “No server upload” does not mean “data never leaves this device.” Keep the manual signaling and `iceServers: []` boundary visible in the UI/help text, and do not silently add STUN/TURN later.
+The GitHub Pages deployment still requires the initial HTML request. Browser extensions, the operating system, downloaded-file destinations, and any site where a user later uploads an exported file are outside the application's trust boundary.
 
-## Input files
+A generated HTML file is executable code. Distribute standalone HTML files through a trusted channel and verify hashes in high-trust workflows.
 
-Applications created from this template may parse untrusted local files. Implementations should:
+Pose landmark data may still be personal or sensitive in context because it describes human motion. Do not automatically treat `.pose.json`, `.pose-template.json`, or exported viewer HTML as anonymous data.
 
-- Validate type, size, and structure before expensive processing.
-- Avoid unbounded allocation or recursion.
-- Handle malformed data without exposing stack traces to users.
-- Release Blob URLs, workers, canvas resources, and large buffers.
-- Make destructive transformations reversible where practical.
-- Never upload a selected file unless the product explicitly requires it and the user is clearly informed.
+## Camera permissions
+
+Camera permission is controlled by the browser and operating system.
+
+Pose Studio:
+
+- Requests video only; microphone audio is not requested.
+- Starts the camera only after an explicit user action.
+- Stops every active video track when the camera is stopped.
+- Releases the current `MediaStream` when the page is torn down.
+- Does not persist camera pixels to IndexedDB or export them.
+
+## Imported data
+
+`.pose.json` and `.pose-template.json` files are untrusted local input.
+
+The application should:
+
+- Reject imports larger than the configured limit (25 MB in v1.0).
+- Require the Browser Kitty pose format marker and supported schema version.
+- Accept only the expected recording / reference kinds.
+- Parse imported content as JSON data and never execute it as script.
+- Avoid unbounded recursion or allocation while validating malformed input.
+- Show recoverable user-facing errors rather than raw stack traces.
+
+## Resource handling
+
+Pose Studio should release or bound browser resources where practical:
+
+- Stop camera tracks when not needed.
+- Avoid queueing pose-inference frames without bound.
+- Invalidate stale asynchronous results when the camera generation changes.
+- Revoke temporary Blob URLs.
+- Terminate / replace workers when the runtime is restarted.
+- Keep recording duration bounded (five minutes in v1.0).
 
 ## Dependency review
 
-Before adding or upgrading a package:
+Before adding or upgrading a package or model:
 
-- Confirm the package identity and exact version.
-- Review the scheduled dependency Issue; never treat an available update as an automatic approval to upgrade.
-- Review its license and required notices.
-- Inspect the browser bundle and package scripts.
-- Confirm every runtime support asset is embedded.
-- Refresh the selected lock entry with the dependency scripts; never hand-edit a lock hash to bypass a mismatch.
+- Confirm package / artifact identity and exact version.
+- Review its license and required redistribution notices.
+- Inspect browser-facing bundle code and package scripts.
+- Confirm every runtime support asset is embedded into the generated HTML.
+- Pin remote build assets with SHA-256.
 - Rebuild with a clean cache.
-- Test with the network disabled.
+- Test with the runtime network disabled.
+- Re-check Content Security Policy and the browser Network panel.
+
+See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the currently bundled dependencies.
+
+## Motion Notes 2.0 changes
+
+Timed notes are treated as untrusted text: escaped in app markup and assigned through textContent in standalone viewers. JSON imports enforce sample/coordinate/time/note bounds before persistence. PNG rendering does not execute note text. Export filenames strip path separators and control characters.
+
+The embedded MediaPipe JavaScript sender is disabled by an exact, guarded build transform after original npm archive integrity verification. CSP still permits only blob: connections for embedded WASM, blocking HTTP/HTTPS. No telemetry endpoint is contacted by the tested inference flow. Preserve the transform and network tests on upgrades.

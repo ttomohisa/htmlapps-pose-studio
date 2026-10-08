@@ -1,4 +1,54 @@
 {
   "$schema": "./schemas/dependencies.schema.json",
-  "dependencies": []
+  "dependencies": [
+    {
+      "id": "mediapipe-vision",
+      "package": "@mediapipe/tasks-vision",
+      "version": "1.0.1",
+      "license": "Apache-2.0",
+      "homepage": "https://ai.google.dev/edge/mediapipe",
+      "assets": [
+        {
+          "key": "module",
+          "path": "vision_bundle.mjs",
+          "mime": "text/javascript",
+          "stripSourceMapComment": true,
+          "compression": "auto"
+        },
+        {
+          "key": "wasm-loader",
+          "path": "wasm/vision_wasm_internal.js",
+          "mime": "text/javascript",
+          "compression": "auto"
+        },
+        {
+          "key": "wasm",
+          "path": "wasm/vision_wasm_internal.wasm",
+          "mime": "application/wasm",
+          "compression": "auto"
+        }
+      ],
+      "updates": {
+        "enabled": true,
+        "policy": "manual"
+      }
+    }
+  ],
+  "remoteAssets": [
+    {
+      "id": "pose-model",
+      "version": "pose-landmarker-lite-float16-v1",
+      "license": "Apache-2.0",
+      "homepage": "https://ai.google.dev/edge/mediapipe/solutions/vision/pose_landmarker",
+      "assets": [
+        {
+          "key": "lite",
+          "url": "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+          "sha256": "59929e1d1ee95287735ddd833b19cf4ac46d29bc7afddbbf6753c459690d574a",
+          "mime": "application/octet-stream",
+          "compression": "auto"
+        }
+      ]
+    }
+  ]
 }

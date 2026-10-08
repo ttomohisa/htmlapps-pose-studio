@@ -23,8 +23,7 @@
         "required": [
           "id",
           "package",
-          "version",
-          "tarballSha256"
+          "version"
         ],
         "properties": {
           "id": {
@@ -47,7 +46,19 @@
             "type": "string",
             "minLength": 1
           }
-        }
+        },
+        "anyOf": [
+          {
+            "required": [
+              "tarballSha256"
+            ]
+          },
+          {
+            "required": [
+              "integrity"
+            ]
+          }
+        ]
       }
     }
   }
